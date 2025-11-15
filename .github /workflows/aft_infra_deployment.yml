@@ -1,0 +1,78 @@
+---
+name: INFRASTRUCTURE SETUP FROM AFT ACCOUNT
+run-name: '[${{ github.event_name }} - ${{ github.ref_name }}] backend deployment by @${{ github.actor }}'
+
+on:
+  workflow_dispatch
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+    terraformS3Key: ${{ secrets.CT_MANAGEMENT_ACCOUNT_ID }}/${{ github.repository }}/${{ github.ref_name}}.tfstate
+    terraformModulesGithubOrg: ${{ github.repository_owner}}
+    githubToken: ${{ secrets.LEUTEQ_GITHUB_TOKEN }}
+    terraformS3Acl: bucket-owner-full-control
+    oidcRoleName: leuteq-master-oidc-admin-role
+    terraformBucket: leuteq-master-organization-tf-state
+    terraformDynamo: leuteq-master-organization-tf-state
+    terraformS3Encryption: true
+    terraformVersion: 1.9.5
+    awsRegion: us-east-1
+
+    # .tfvars Terraform Variables
+    TF_VAR_aft_management_account_id: ${{ secrets.AFT_MANAGEMENT_ACCOUNT_ID }}
+    TF_VAR_ct_management_account_id: ${{ secrets.CT_MANAGEMENT_ACCOUNT_ID }}
+    TF_VAR_log_archive_account_id: ${{ secrets.LOG_ARCHIVE_ACCOUNT_ID }}
+    TF_VAR_audit_account_id: ${{ secrets.AUDIT_ACCOUNT_ID }}
+
+jobs:
+    CT_AFT_SETUP:
+        name: Control Tower AFT Setup
+        runs-on: ubuntu-latest
+        steps:
+            - name: Check out code
+              uses: actions/checkout@v4
+
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v2
+              with:
+                terraform_version: ${{ env.terraformVersion }}
+                terraform_wrapper: false
+
+            - name: configure aws credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::${{ secrets.CT_MANAGEMENT_ACCOUNT_ID }}:role/${{ env.oidcRoleName }}
+                role-session-name: OIDCSession
+                aws-region: ${{ env.awsRegion }}
+
+            - name: Setup git repo credentials for terraform modules
+              run: |
+                  git config --global \
+                  url."https://git:${{ env.githubToken }}@github.com/${{ env.terraformModulesGithubOrg }}".insteadOf \
+                  "https://github.com/${{ env.terraformModulesGithubOrg }}"
+              shell: sh
+
+            - name: Terraform Init
+              id: init
+              run: terraform init -backend-config="bucket=${{ env.terraformBucket }}" -backend-config="dynamodb_table=${{ env.terraformDynamo }}" -backend-config="key=${{ env.terraformS3Key}}" -backend-config="region=${{ env.awsRegion }}" -backend-config="acl=${{ env.terraformS3Acl }}" -backend-config="encrypt=${{ env.terraformS3Encryption }}"
+
+            - name: Terraform Format
+              run: terraform fmt --check
+
+            - name: Terraform Validate
+              id: validate
+              run: terraform validate
+
+            - name: Terraform Plan
+              id: plan
+              if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+              run: terraform plan --var-file=terraform.tfvars -no-color -out tf.plan
+
+            - name: Terraform Apply
+              id: apply
+              run: |
+                terraform apply --var-file=terraform.tfvars -auto-approve
